@@ -1,4 +1,4 @@
-# Salesforce Service Cloud to Azure Sentinel - Multi-Environment Integration
+# Salesforce Service Cloud to Microsoft Sentinel - Multi-Environment Integration
 
 ## Overview
 
