@@ -1,0 +1,597 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "workspaceName": {
+      "type": "string",
+      "metadata": {
+        "description": "Log Analytics Workspace name"
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Location for all resources"
+      }
+    },
+    "keyVaultName": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Key Vault name (leave empty for auto-generated)"
+      }
+    },
+    "environments": {
+      "type": "array",
+      "metadata": {
+        "description": "Array of environments"
+      },
+      "defaultValue": [
+        {
+          "name": "prod",
+          "salesforceDomain": "https://yourorg.my.salesforce.com"
+        },
+        {
+          "name": "preProd",
+          "salesforceDomain": "https://yourorg--preprod.my.salesforce.com"
+        }
+      ]
+    },
+    "createSharedResources": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Create shared resources"
+      }
+    },
+    "functionAppName": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Function App name (leave empty for auto-generated)"
+      }
+    }
+  },
+  "variables": {
+    "keyVaultName": "[if(empty(parameters('keyVaultName')), concat('kv-sf-', take(uniqueString(resourceGroup().id), 10)), parameters('keyVaultName'))]",
+    "dceName": "[concat(parameters('workspaceName'), '-shared-dce')]",
+    "functionAppName": "[if(empty(parameters('functionAppName')), concat('func-sf-', take(uniqueString(resourceGroup().id), 10)), parameters('functionAppName'))]",
+    "storageAccountName": "[concat('stgsf', take(uniqueString(resourceGroup().id), 10))]",
+    "appServicePlanName": "[concat('asp-sf-', take(uniqueString(resourceGroup().id), 10))]",
+    "tableName": "SalesforceServiceCloudV2_CL",
+    "streamName": "Custom-SalesforceServiceCloudV2_CL",
+    "workspaceResourceId": "[resourceId('Microsoft.OperationalInsights/Workspaces', parameters('workspaceName'))]",
+    "dceResourceId": "[resourceId('Microsoft.Insights/dataCollectionEndpoints', variables('dceName'))]",
+    "keyVaultResourceId": "[resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName'))]",
+    "appInsightsName": "[concat('appi-sf-', take(uniqueString(resourceGroup().id), 10))]"
+  },
+  "resources": [
+    {
+      "condition": "[parameters('createSharedResources')]",
+      "type": "Microsoft.KeyVault/vaults",
+      "apiVersion": "2023-02-01",
+      "name": "[variables('keyVaultName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "sku": {
+          "family": "A",
+          "name": "standard"
+        },
+        "tenantId": "[subscription().tenantId]",
+        "enableRbacAuthorization": true,
+        "enableSoftDelete": true,
+        "softDeleteRetentionInDays": 7,
+        "publicNetworkAccess": "Enabled"
+      }
+    },
+    {
+      "condition": "[parameters('createSharedResources')]",
+      "type": "Microsoft.OperationalInsights/workspaces/tables",
+      "apiVersion": "2022-10-01",
+      "name": "[concat(parameters('workspaceName'), '/', variables('tableName'))]",
+      "properties": {
+        "plan": "Analytics",
+        "schema": {
+          "name": "[variables('tableName')]",
+          "columns": [
+            {
+              "name": "TimeGenerated",
+              "type": "datetime"
+            },
+            {
+              "name": "Timestamp",
+              "type": "string"
+            },
+            {
+              "name": "TimestampDerived",
+              "type": "datetime"
+            },
+            {
+              "name": "EventType",
+              "type": "string"
+            },
+            {
+              "name": "EnvironmentName",
+              "type": "string"
+            },
+            {
+              "name": "RequestId",
+              "type": "string"
+            },
+            {
+              "name": "UserId",
+              "type": "string"
+            },
+            {
+              "name": "UserName",
+              "type": "string"
+            },
+            {
+              "name": "UniqueLogFileId",
+              "type": "string"
+            },
+            {
+              "name": "LogFileSequence",
+              "type": "int"
+            },
+            {
+              "name": "JsonData",
+              "type": "dynamic"
+            },
+            {
+              "name": "RawData",
+              "type": "string"
+            }
+          ]
+        },
+        "retentionInDays": 30
+      }
+    },
+    {
+      "condition": "[parameters('createSharedResources')]",
+      "type": "Microsoft.Insights/dataCollectionEndpoints",
+      "apiVersion": "2021-09-01-preview",
+      "name": "[variables('dceName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "networkAcls": {
+          "publicNetworkAccess": "Enabled"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-01-01",
+      "name": "[variables('storageAccountName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "kind": "StorageV2",
+      "properties": {
+        "supportsHttpsTrafficOnly": true,
+        "minimumTlsVersion": "TLS1_2",
+        "allowSharedKeyAccess": false,
+        "publicNetworkAccess": "Enabled"
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+      "apiVersion": "2023-01-01",
+      "name": "[concat(variables('storageAccountName'), '/default/deployments')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+      ],
+      "properties": {
+        "publicAccess": "None"
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/tableServices",
+      "apiVersion": "2023-01-01",
+      "name": "[concat(variables('storageAccountName'), '/default')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/tableServices/tables",
+      "apiVersion": "2023-01-01",
+      "name": "[concat(variables('storageAccountName'), '/default/SalesforceEventLogState')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts/tableServices', variables('storageAccountName'), 'default')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Insights/components",
+      "apiVersion": "2020-02-02",
+      "name": "[variables('appInsightsName')]",
+      "location": "[parameters('location')]",
+      "kind": "web",
+      "properties": {
+        "Application_Type": "web",
+        "WorkspaceResourceId": "[variables('workspaceResourceId')]"
+      }
+    },
+    {
+      "type": "Microsoft.Web/serverfarms",
+      "apiVersion": "2023-12-01",
+      "name": "[variables('appServicePlanName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "FC1",
+        "tier": "FlexConsumption"
+      },
+      "properties": {
+        "reserved": true
+      }
+    },
+    {
+      "copy": {
+        "name": "dcrCopy",
+        "count": "[length(parameters('environments'))]"
+      },
+      "type": "Microsoft.Insights/dataCollectionRules",
+      "apiVersion": "2021-09-01-preview",
+      "name": "[concat('SalesforceServiceCloud-', parameters('environments')[copyIndex()].name, '-DCR')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces/tables', parameters('workspaceName'), variables('tableName'))]",
+        "[variables('dceResourceId')]"
+      ],
+      "properties": {
+        "dataCollectionEndpointId": "[variables('dceResourceId')]",
+        "streamDeclarations": {
+          "[variables('streamName')]": {
+            "columns": [
+              {
+                "name": "TimeGenerated",
+                "type": "datetime"
+              },
+              {
+                "name": "Timestamp",
+                "type": "string"
+              },
+              {
+                "name": "TimestampDerived",
+                "type": "datetime"
+              },
+              {
+                "name": "EventType",
+                "type": "string"
+              },
+              {
+                "name": "EnvironmentName",
+                "type": "string"
+              },
+              {
+                "name": "RequestId",
+                "type": "string"
+              },
+              {
+                "name": "UserId",
+                "type": "string"
+              },
+              {
+                "name": "UserName",
+                "type": "string"
+              },
+              {
+                "name": "UniqueLogFileId",
+                "type": "string"
+              },
+              {
+                "name": "LogFileSequence",
+                "type": "int"
+              },
+              {
+                "name": "JsonData",
+                "type": "dynamic"
+              },
+              {
+                "name": "RawData",
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "destinations": {
+          "logAnalytics": [
+            {
+              "workspaceResourceId": "[variables('workspaceResourceId')]",
+              "name": "clv2ws1"
+            }
+          ]
+        },
+        "dataFlows": [
+          {
+            "streams": [
+              "[variables('streamName')]"
+            ],
+            "destinations": [
+              "clv2ws1"
+            ],
+            "transformKql": "source",
+            "outputStream": "[variables('streamName')]"
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Web/sites",
+      "apiVersion": "2023-12-01",
+      "name": "[variables('functionAppName')]",
+      "location": "[parameters('location')]",
+      "kind": "functionapp,linux",
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/serverfarms', variables('appServicePlanName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]",
+        "[resourceId('Microsoft.Insights/components', variables('appInsightsName'))]",
+        "[variables('keyVaultResourceId')]",
+        "dcrCopy"
+      ],
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', variables('appServicePlanName'))]",
+        "functionAppConfig": {
+          "deployment": {
+            "storage": {
+              "type": "blobContainer",
+              "value": "[concat(reference(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), '2023-01-01').primaryEndpoints.blob, 'deployments')]",
+              "authentication": {
+                "type": "SystemAssignedIdentity"
+              }
+            }
+          },
+          "scaleAndConcurrency": {
+            "maximumInstanceCount": 100,
+            "instanceMemoryMB": 2048
+          },
+          "runtime": {
+            "name": "python",
+            "version": "3.11"
+          }
+        },
+        "siteConfig": {
+          "appSettings": [
+            {
+              "name": "AzureWebJobsStorage__accountName",
+              "value": "[variables('storageAccountName')]"
+            },
+            {
+              "name": "AzureWebJobsStorage__credential",
+              "value": "managedidentity"
+            },
+            {
+              "name": "STATE_STORAGE_ACCOUNT",
+              "value": "[variables('storageAccountName')]"
+            },
+            {
+              "name": "APPINSIGHTS_INSTRUMENTATIONKEY",
+              "value": "[reference(resourceId('Microsoft.Insights/components', variables('appInsightsName')), '2020-02-02').InstrumentationKey]"
+            },
+            {
+              "name": "APPLICATIONINSIGHTS_CONNECTION_STRING",
+              "value": "[reference(resourceId('Microsoft.Insights/components', variables('appInsightsName')), '2020-02-02').ConnectionString]"
+            },
+            {
+              "name": "KEY_VAULT_NAME",
+              "value": "[variables('keyVaultName')]"
+            },
+            {
+              "name": "DCE_ENDPOINT",
+              "value": "[if(equals(parameters('createSharedResources'), bool('true')), reference(variables('dceResourceId'), '2021-09-01-preview').logsIngestion.endpoint, reference(resourceId('Microsoft.Insights/dataCollectionEndpoints', variables('dceName')), '2021-09-01-preview').logsIngestion.endpoint)]"
+            },
+            {
+              "name": "STREAM_NAME",
+              "value": "[variables('streamName')]"
+            },
+            {
+              "name": "ENVIRONMENTS_JSON",
+              "value": "[if(equals(parameters('createSharedResources'), bool('true')), string(parameters('environments')), '')]"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "Microsoft.SecurityInsights/dataConnectorDefinitions",
+      "apiVersion": "2024-01-01-preview",
+      "name": "SalesforceServiceCloudV2Definition",
+      "location": "[parameters('location')]",
+      "scope": "[concat('Microsoft.OperationalInsights/workspaces/', parameters('workspaceName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/sites', variables('functionAppName'))]",
+        "[resourceId('Microsoft.OperationalInsights/workspaces/tables', parameters('workspaceName'), variables('tableName'))]"
+      ],
+      "kind": "Customizable",
+      "properties": {
+        "connectorUiConfig": {
+          "id": "SalesforceServiceCloudV2MultiEnv",
+          "title": "Salesforce Service Cloud (Multi-Environment)",
+          "publisher": "Custom",
+          "descriptionMarkdown": "This connector ingests Salesforce EventLogFile data from multiple environments into Microsoft Sentinel using an Azure Function. The solution supports production, pre-production, and other Salesforce environments with centralized log collection and per-environment Data Collection Rules.",
+          "graphQueries": [
+            {
+              "metricName": "Total events received",
+              "legend": "Salesforce Events",
+              "baseQuery": "SalesforceServiceCloudV2_CL"
+            }
+          ],
+          "sampleQueries": [
+            {
+              "description": "All Salesforce Events (last 24 hours)",
+              "query": "SalesforceServiceCloudV2_CL\n| where TimeGenerated > ago(24h)\n| take 100"
+            },
+            {
+              "description": "Events by Environment",
+              "query": "SalesforceServiceCloudV2_CL\n| where TimeGenerated > ago(7d)\n| summarize Count=count() by EnvironmentName\n| order by Count desc"
+            },
+            {
+              "description": "Recent Login Events",
+              "query": "SalesforceServiceCloudV2_CL\n| where EventType == 'Login'\n| where TimeGenerated > ago(24h)\n| project TimeGenerated, EnvironmentName, UserName, EventType"
+            }
+          ],
+          "dataTypes": [
+            {
+              "name": "SalesforceServiceCloudV2_CL",
+              "lastDataReceivedQuery": "SalesforceServiceCloudV2_CL\n| summarize Time = max(TimeGenerated)\n| where isnotempty(Time)"
+            }
+          ],
+          "connectivityCriteria": [
+            {
+              "type": "IsConnectedQuery",
+              "value": [
+                "SalesforceServiceCloudV2_CL\n| where TimeGenerated > ago(3d)\n| take 1\n| project IsConnected = true"
+              ]
+            }
+          ],
+          "availability": {
+            "status": 1,
+            "isPreview": false
+          },
+          "permissions": {
+            "resourceProvider": [
+              {
+                "provider": "Microsoft.OperationalInsights/workspaces",
+                "permissionsDisplayText": "read and write permissions are required",
+                "providerDisplayName": "Workspace",
+                "scope": "Workspace",
+                "requiredPermissions": {
+                  "write": true,
+                  "read": true,
+                  "delete": false
+                }
+              }
+            ],
+            "customs": [
+              {
+                "name": "Salesforce OAuth Application",
+                "description": "A Connected App in Salesforce with OAuth enabled and EventLogFile API access is required for each environment"
+              },
+              {
+                "name": "Azure Function with Managed Identity",
+                "description": "Azure Function (Flex Consumption) with system-assigned managed identity and appropriate permissions to Key Vault, Data Collection Endpoints, and Storage Account"
+              }
+            ]
+          },
+          "instructionSteps": [
+            {
+              "title": "Solution Architecture",
+              "description": "This solution uses an Azure Function (Flex Consumption plan) to collect Salesforce EventLogFile data from multiple environments. Each environment has its own Data Collection Rule (DCR) for data ingestion into a shared Log Analytics table.",
+              "innerSteps": []
+            },
+            {
+              "title": "Deployed Resources",
+              "description": "The following Azure resources have been deployed:\n\n- **Function App:** Processes Salesforce data collection (timer-triggered every 60 minutes)\n- **Data Collection Endpoint (DCE):** Shared endpoint for log ingestion\n- **Data Collection Rules (DCRs):** One per environment for data routing\n- **Key Vault:** Stores Salesforce OAuth credentials per environment\n- **Log Analytics Table:** SalesforceServiceCloudV2_CL (centralized data storage)\n- **Application Insights:** Function monitoring and diagnostics",
+              "innerSteps": []
+            },
+            {
+              "title": "Verify Data Ingestion",
+              "description": "Run the following KQL query in Log Analytics to verify data is being ingested from your environments:\n\n```kusto\nSalesforceServiceCloudV2_CL\n| where TimeGenerated > ago(1h)\n| summarize Count=count(), LatestEvent=max(TimeGenerated) by EnvironmentName\n| order by EnvironmentName asc\n```\n\nExpected result: One row per configured environment with event counts.",
+              "innerSteps": []
+            },
+            {
+              "title": "Monitor Function Health",
+              "description": "Monitor the Azure Function execution and health:\n\n1. Navigate to **Azure Portal** > **Function App** > [your function name]\n2. Select **Monitor** > **Invocations** to view execution history\n3. Check **Application Insights** > **Logs** for detailed diagnostics\n4. Expected execution: Every 60 minutes per environment\n\nCommon issues:\n- Function not appearing: Remote build may still be in progress (takes 5-10 minutes after deployment)\n- No data: Verify OAuth credentials in Key Vault and Salesforce API permissions",
+              "innerSteps": []
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "Microsoft.SecurityInsights/dataConnectors",
+      "apiVersion": "2024-01-01-preview",
+      "name": "[guid(resourceGroup().id, 'SalesforceServiceCloudV2Instance')]",
+      "location": "[parameters('location')]",
+      "scope": "[concat('Microsoft.OperationalInsights/workspaces/', parameters('workspaceName'))]",
+      "dependsOn": [
+        "[extensionResourceId(resourceId('Microsoft.OperationalInsights/workspaces', parameters('workspaceName')), 'Microsoft.SecurityInsights/dataConnectorDefinitions', 'SalesforceServiceCloudV2Definition')]",
+        "[resourceId('Microsoft.Web/sites', variables('functionAppName'))]"
+      ],
+      "kind": "GenericUI",
+      "properties": {
+        "connectorUiConfig": {
+          "id": "SalesforceServiceCloudV2MultiEnv",
+          "title": "Salesforce Service Cloud (Multi-Environment)",
+          "publisher": "Custom",
+          "descriptionMarkdown": "Active connector instance ingesting Salesforce EventLogFile data from multiple environments via Azure Function.",
+          "graphQueries": [
+            {
+              "metricName": "Total events received",
+              "legend": "Salesforce Events",
+              "baseQuery": "SalesforceServiceCloudV2_CL"
+            }
+          ],
+          "dataTypes": [
+            {
+              "name": "SalesforceServiceCloudV2_CL",
+              "lastDataReceivedQuery": "SalesforceServiceCloudV2_CL\n| summarize Time = max(TimeGenerated)\n| where isnotempty(Time)"
+            }
+          ],
+          "connectivityCriteria": [
+            {
+              "type": "IsConnectedQuery",
+              "value": [
+                "SalesforceServiceCloudV2_CL\n| where TimeGenerated > ago(3d)\n| take 1\n| project IsConnected = true"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceGroup().id, variables('functionAppName'), 'storage-blob-contributor')]",
+      "scope": "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]",
+        "[resourceId('Microsoft.Web/sites', variables('functionAppName'))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')]",
+        "principalId": "[reference(resourceId('Microsoft.Web/sites', variables('functionAppName')), '2023-12-01', 'Full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      }
+    }
+  ],
+  "outputs": {
+    "keyVaultName": {
+      "type": "string",
+      "value": "[variables('keyVaultName')]"
+    },
+    "dceName": {
+      "type": "string",
+      "value": "[variables('dceName')]"
+    },
+    "dceEndpoint": {
+      "type": "string",
+      "value": "[if(parameters('createSharedResources'), reference(variables('dceResourceId'), '2021-09-01-preview').logsIngestion.endpoint, 'existing')]"
+    },
+    "dcrDetails": {
+      "type": "array",
+      "copy": {
+        "count": "[length(parameters('environments'))]",
+        "input": {
+          "environmentName": "[parameters('environments')[copyIndex()].name]",
+          "dcrName": "[concat('SalesforceServiceCloud-', parameters('environments')[copyIndex()].name, '-DCR')]",
+          "dcrImmutableId": "[reference(resourceId('Microsoft.Insights/dataCollectionRules', concat('SalesforceServiceCloud-', parameters('environments')[copyIndex()].name, '-DCR')), '2021-09-01-preview').immutableId]",
+          "salesforceDomain": "[parameters('environments')[copyIndex()].salesforceDomain]"
+        }
+      }
+    },
+    "functionAppName": {
+      "type": "string",
+      "value": "[variables('functionAppName')]"
+    },
+    "functionAppPrincipalId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Web/sites', variables('functionAppName')), '2023-01-01', 'Full').identity.principalId]"
+    }
+  }
+}
