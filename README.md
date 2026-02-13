@@ -407,9 +407,7 @@ SalesforceServiceCloudV2_CL
 | where LastIngestion < ago(3h)
 ```
 
-## Support and Contributions
-
-### Common Query Patterns
+## Common Query Patterns
 
 **Event distribution by environment:**
 ```kusto
