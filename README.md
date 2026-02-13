@@ -216,7 +216,7 @@ SalesforceServiceCloudV2_CL
 
 ## Microsoft Sentinel Analytics Rules
 
-The solution includes three pre-built analytics rules for detecting security threats in your Salesforce environments. These YAML files are located in the `AnalyticRules/` folder:
+The solution includes three pre-built analytics rules for detecting security threats in your Salesforce environments. These YAML files are located in the `analytic-rules/` folder:
 
 | Rule Name | Severity | MITRE ATT&CK | Description |
 |-----------|----------|--------------|-------------|
@@ -225,9 +225,9 @@ The solution includes three pre-built analytics rules for detecting security thr
 | **Password Spray Multi-User** | High | T1110.001 (Password Spraying) | Flags single IPs targeting 15+ unique users with failed logins in 5-minute windows |
 
 **Files:**
-- `AnalyticRules/SalesforceSuccessfulBruteForceLogin.yaml`
-- `AnalyticRules/SalesforceImpossibleTravelLogins.yaml`
-- `AnalyticRules/SalesforcePasswordSprayMultiUser.yaml`
+- `analytic-rules/SalesforceSuccessfulBruteForceLogin.yaml`
+- `analytic-rules/SalesforceImpossibleTravelLogins.yaml`
+- `analytic-rules/SalesforcePasswordSprayMultiUser.yaml`
 
 These rules leverage the `SalesforceServiceCloudV2_CL` table and provide entity mapping for automated incident enrichment in Microsoft Sentinel.
 
