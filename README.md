@@ -214,9 +214,14 @@ SalesforceServiceCloudV2_CL
 | prod | 1,234 | 2026-02-19T23:05:00Z | 5 |
 | dev | 567 | 2026-02-19T23:06:00Z | 3 |
 
+### 3. Adjust Data Retention
+
+- Navigate to **Log Analytics Workspace** → **Tables** → `SalesforceServiceCloudV2_CL`
+- Change the **retention period** to align with your environment (default is 30 days)
+
 ## Microsoft Sentinel Analytics Rules
 
-The solution includes three pre-built analytics rules for detecting security threats in your Salesforce environments. These YAML files are located in the `analytic-rules/` folder:
+The solution includes three pre-built analytics rules for detecting security threats in your Salesforce environments. These YAML files are located in the `analytic-rules/` folder. You can also develop your own detection rules to tailor threat detection to your specific environment.
 
 | Rule Name | Severity | MITRE ATT&CK | Description |
 |-----------|----------|--------------|-------------|
