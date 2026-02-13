@@ -28,6 +28,9 @@ This solution provides automated ingestion of Salesforce EventLogFile data into 
 | **Log Analytics Table** | Centralized table for all Salesforce events | `SalesforceServiceCloudV2_CL` |
 | **Application Insights** | Function monitoring and diagnostics | `appi-sf-{uniqueId}` |
 
+![ArchitectureDiagram](./images/ArchitectureDiagram.png)
+*Figure 1: Architecture Diagram*
+
 ### Data Flow
 
 ```
@@ -227,6 +230,9 @@ The solution includes three pre-built analytics rules for detecting security thr
 - `AnalyticRules/SalesforcePasswordSprayMultiUser.yaml`
 
 These rules leverage the `SalesforceServiceCloudV2_CL` table and provide entity mapping for automated incident enrichment in Microsoft Sentinel.
+
+![SentinelIncidents](./images/Incidents.png)
+*Figure 2: incidents in Sentinel*
 
 ## Configuration Reference
 
