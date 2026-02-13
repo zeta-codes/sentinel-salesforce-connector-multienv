@@ -451,8 +451,5 @@ SalesforceServiceCloudV2_CL
 
 | Version | Date | Changes |
 |---------|------|---------|
-| 1.0 | 2026-02-12 | Initial release with multi-environment support |
+| 1.0 | 2026-02-13 | Initial release with multi-environment support |
 
-## License
-
-This solution is provided as-is for use with Microsoft Sentinel and Salesforce Service Cloud integration.
