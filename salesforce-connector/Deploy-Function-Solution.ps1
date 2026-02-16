@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Automates multi-environment Azure Function deployment for Salesforce Service Cloud integration with Microsoft Sentinel using Data Collection Rules and managed identities.
 
@@ -95,7 +95,21 @@ if ($Mode -eq "AddEnv") {
         exit 1
     }
 
-    $subscriptionId = (Get-AzContext).Subscription.Id
+    $azContext = Get-AzContext
+    if ($azContext -and $azContext.Subscription) {
+        $targetSubId = $azContext.Subscription.Id
+        $targetSubName = $azContext.Subscription.Name
+        
+        # Check Azure CLI context
+        $currentCliSub = az account show --query name -o tsv 2>$null
+        if ($currentCliSub -ne $targetSubName) {
+            Write-Host "⚠️  Synchronizing Azure CLI to PowerShell context..." -ForegroundColor Yellow
+            az account set --subscription $targetSubId
+            Write-Host "✅ Azure CLI set to: $targetSubName" -ForegroundColor Green
+        }
+    }
+
+    $subscriptionId = $azContext.Subscription.Id
 
     # [1/4] READ existing Env + DCE_ENDPOINT
     Write-Host "`n[1/4] Reading current ENVIRONMENTS_JSON + DCE_ENDPOINT..." -ForegroundColor Yellow
@@ -467,34 +481,34 @@ if ($Mode -eq "CredsOnly") {
 # ================================================
 # MODE: CODE ONLY (Deploy/Update Function Code)
 # ================================================
-
+ 
 if ($Mode -eq "CodeOnly") {
     Write-Host "`n========================================" -ForegroundColor Cyan
     Write-Host "FUNCTION CODE DEPLOYMENT MODE" -ForegroundColor Cyan
     Write-Host "========================================`n" -ForegroundColor Cyan
-
+ 
     # Find Function App
     Write-Host "[1/4] Looking for Function App..." -ForegroundColor Yellow
-
+ 
     if ($FunctionAppName) {
         $functionAppName = $FunctionAppName
     }
     else {
         $functionApps = Get-AzFunctionApp -ResourceGroupName $ResourceGroupName | Where-Object { $_.Name -like "func-sf-*" }
-
+ 
         if ($functionApps.Count -eq 0) {
             Write-Host "❌ No Function App found in resource group $ResourceGroupName" -ForegroundColor Red
             exit 1
         }
-
+ 
         $functionAppName = $functionApps[0].Name
     }
-
+ 
     Write-Host "✅ Found Function App: $functionAppName" -ForegroundColor Green
-
+ 
     # Verify Azure CLI is available (REQUIRED for Flex Consumption remote build)
     Write-Host "`n[2/4] Verifying Azure CLI..." -ForegroundColor Yellow
-
+ 
     try {
         $azVersion = az version --output json 2>$null | ConvertFrom-Json
         Write-Host "✅ Azure CLI version: $($azVersion.'azure-cli')" -ForegroundColor Green
@@ -509,35 +523,64 @@ if ($Mode -eq "CodeOnly") {
         Write-Host "After installation, run: az login`n" -ForegroundColor White
         exit 1
     }
-
+ 
     # Ensure logged into Azure CLI
     $accountInfo = az account show 2>$null
     if (-not $accountInfo) {
         Write-Host "Logging into Azure CLI..." -ForegroundColor Yellow
         az login
-
+ 
         if ($LASTEXITCODE -ne 0) {
             Write-Host "❌ Azure CLI login failed" -ForegroundColor Red
             exit 1
         }
     }
-
+ 
     Write-Host "✅ Logged in to Azure" -ForegroundColor Green
-
+ 
+    # Sync Azure CLI subscription with PowerShell Az context
+    Write-Host "`nSynchronizing subscription context..." -ForegroundColor Yellow
+    $currentCliSub = az account show --query name -o tsv 2>$null
+    Write-Host "  Azure CLI subscription: $currentCliSub" -ForegroundColor Gray
+ 
+    # Get subscription from PowerShell context
+    $azContext = Get-AzContext
+    if ($azContext -and $azContext.Subscription) {
+        $targetSubId = $azContext.Subscription.Id
+        $targetSubName = $azContext.Subscription.Name
+        Write-Host "  PowerShell Az subscription: $targetSubName" -ForegroundColor Gray
+        if ($currentCliSub -ne $targetSubName) {
+            Write-Host "  ⚠️  Subscription mismatch detected - switching Azure CLI context..." -ForegroundColor Yellow
+            az account set --subscription $targetSubId
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "❌ Failed to set subscription" -ForegroundColor Red
+                exit 1
+            }
+            Write-Host "  ✅ Azure CLI switched to: $targetSubName" -ForegroundColor Green
+        }
+        else {
+            Write-Host "  ✅ Subscriptions already synchronized" -ForegroundColor Green
+        }
+    }
+    else {
+        Write-Host "  ⚠️  Warning: Could not determine subscription from PowerShell context" -ForegroundColor Yellow
+        Write-Host "  Continuing with current Azure CLI subscription: $currentCliSub" -ForegroundColor Gray
+    }
+ 
     # Verify function code path
     Write-Host "`n[3/4] Verifying function code..." -ForegroundColor Yellow
-
+ 
     if (-not (Test-Path $FunctionCodePath)) {
         Write-Host "❌ Function code path not found: $FunctionCodePath" -ForegroundColor Red
         exit 1
     }
-
+ 
     $requiredFiles = @(
         "function_app.py",
         "requirements.txt",
         "host.json"
     )
-
+ 
     foreach ($file in $requiredFiles) {
         $filePath = Join-Path $FunctionCodePath $file
         if (Test-Path $filePath) {
@@ -548,106 +591,122 @@ if ($Mode -eq "CodeOnly") {
             exit 1
         }
     }
-
+ 
     # Create deployment package and deploy
     Write-Host "`n[4/4] Creating package and deploying..." -ForegroundColor Yellow
-
+ 
     $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
     $zipFile = "function-package-$timestamp.zip"
-
+ 
     Push-Location $FunctionCodePath
-
+ 
     try {
         # Remove old zip files
         Get-ChildItem -Filter "function-package-*.zip" | Remove-Item -Force -ErrorAction SilentlyContinue
-
+ 
         # Create zip package
         Write-Host "  Creating deployment package..." -ForegroundColor Gray
         $filesToZip = Get-ChildItem -Exclude "*.zip", "local.settings.json", ".venv", "__pycache__", "*.pyc", ".git", ".gitignore", ".vscode"
         Compress-Archive -Path $filesToZip -DestinationPath $zipFile -Force
-
+ 
         $zipPath = Resolve-Path $zipFile
         $zipSizeMB = [math]::Round((Get-Item $zipPath).Length / 1MB, 2)
-
+ 
         Write-Host "  ✅ Package: $zipFile ($zipSizeMB MB)" -ForegroundColor Green
-
+ 
+        # Verify deployment target before proceeding
+        Write-Host "`n  Verifying deployment target..." -ForegroundColor Cyan
+        $currentSubId = az account show --query id -o tsv
+        $currentSubName = az account show --query name -o tsv
+        $rgCheck = az group show --name $ResourceGroupName --query id -o tsv 2>$null
+ 
+        if (-not $rgCheck) {
+            Write-Host "  ❌ Resource group '$ResourceGroupName' not found in current subscription" -ForegroundColor Red
+            Write-Host "     Current subscription: $currentSubName" -ForegroundColor Gray
+            Pop-Location
+            exit 1
+        }
+ 
+        Write-Host "  ✅ Subscription: $currentSubName" -ForegroundColor Green
+        Write-Host "  ✅ Resource Group: $ResourceGroupName" -ForegroundColor Green
+ 
         # Deploy with Azure CLI and remote build
         Write-Host "`n  Deploying with remote build..." -ForegroundColor Cyan
         Write-Host "  This will install packages from requirements.txt in Azure" -ForegroundColor Gray
         Write-Host "  (Build process takes 5-10 minutes...)`n" -ForegroundColor Gray
-
+ 
         az functionapp deployment source config-zip `
             --resource-group $ResourceGroupName `
             --name $functionAppName `
             --src $zipPath `
             --build-remote true `
             --timeout 900
-
+ 
         if ($LASTEXITCODE -eq 0) {
             Write-Host "`n✅ Deployment completed successfully!" -ForegroundColor Green
         }
         else {
             throw "Deployment failed with exit code $LASTEXITCODE"
         }
-
+ 
         Write-Host "`n========================================" -ForegroundColor Cyan
         Write-Host "CODE DEPLOYMENT COMPLETE" -ForegroundColor Cyan
         Write-Host "========================================`n" -ForegroundColor Cyan
-
+ 
         Write-Host "📋 Deployment Details:" -ForegroundColor Cyan
         Write-Host "  Function App: $functionAppName" -ForegroundColor White
         Write-Host "  Package: $zipFile ($zipSizeMB MB)" -ForegroundColor White
         Write-Host "  Method: Azure CLI with remote build" -ForegroundColor White
-
+ 
         Write-Host "`n⏱️  Remote build is running in Azure..." -ForegroundColor Yellow
         Write-Host "  - Installing packages from requirements.txt" -ForegroundColor Gray
         Write-Host "  - This takes 5-10 minutes to complete" -ForegroundColor Gray
         Write-Host "  - Functions will appear after build finishes" -ForegroundColor Gray
-
+ 
         Write-Host "`n📋 After build completes (in ~5-10 minutes):" -ForegroundColor Cyan
-
+ 
         Write-Host "`n  1. Check functions appear:" -ForegroundColor Yellow
         Write-Host "     Portal > Function App > $functionAppName > Functions" -ForegroundColor White
         Write-Host "     Should see: SalesforceToSentinel" -ForegroundColor Gray
-
+ 
         Write-Host "`n  2. Monitor execution:" -ForegroundColor Yellow
         Write-Host "     Portal > Function App > $functionAppName > Monitor > Invocations" -ForegroundColor White
-
+ 
         Write-Host "`n  3. Check Application Insights:" -ForegroundColor Yellow
         Write-Host "     traces | where message contains 'Salesforce' | order by timestamp desc" -ForegroundColor White
-
+ 
         Write-Host "`n  4. Verify data ingestion:" -ForegroundColor Yellow
         Write-Host "     SalesforceServiceCloudV2_CL | where TimeGenerated > ago(1h)" -ForegroundColor White
-
+ 
         Write-Host ""
-
+ 
     }
     catch {
         Write-Host "`n❌ Deployment failed: $($_.Exception.Message)" -ForegroundColor Red
-
+ 
         Write-Host "`n⚠️  Troubleshooting:" -ForegroundColor Yellow
         Write-Host "1. Check deployment logs:" -ForegroundColor White
         Write-Host "   Portal > Function App > $functionAppName > Deployment Center > Logs" -ForegroundColor Gray
-
+ 
         Write-Host "`n2. Verify permissions:" -ForegroundColor White
         Write-Host "   Portal > Function App > $functionAppName > Access Control (IAM)" -ForegroundColor Gray
         Write-Host "   Required: Contributor or Website Contributor role" -ForegroundColor Gray
-
+ 
         Write-Host "`n3. Check Function App status:" -ForegroundColor White
         Write-Host "   Portal > Function App > $functionAppName > Overview" -ForegroundColor Gray
         Write-Host "   Status should be: Running" -ForegroundColor Gray
-
+ 
         Write-Host "`n4. Verify Azure CLI authentication:" -ForegroundColor White
         Write-Host "   Run: az account show" -ForegroundColor Gray
         Write-Host "   Ensure you're logged into the correct subscription" -ForegroundColor Gray
-
+ 
         Pop-Location
         exit 1
     }
     finally {
         Pop-Location
     }
-
+ 
     exit 0
 }
 
