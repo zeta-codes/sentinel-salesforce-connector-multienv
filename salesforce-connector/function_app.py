@@ -9,6 +9,7 @@ import socket
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 
+
 # Import external packages at MODULE LEVEL
 import requests
 from requests.adapters import HTTPAdapter
@@ -17,6 +18,7 @@ from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
 from azure.data.tables import TableClient
 
+
 # Configuration from environment variables
 KEY_VAULT_NAME = os.environ.get('KEY_VAULT_NAME')
 DCE_ENDPOINT = os.environ.get('DCE_ENDPOINT')
@@ -24,12 +26,15 @@ STREAM_NAME = os.environ.get('STREAM_NAME')
 ENVIRONMENTS_JSON = os.environ.get('ENVIRONMENTS_JSON')
 STATE_STORAGE_ACCOUNT = os.environ.get('STATE_STORAGE_ACCOUNT')
 
+
 # Initialize credential at MODULE LEVEL for reuse
 credential = DefaultAzureCredential()
+
 
 # ============================================================================
 # STATE MANAGER CLASS
 # ============================================================================
+
 
 class StateManager:
     """Manages processing state to prevent duplicates and recover missed logs"""
@@ -82,9 +87,11 @@ class StateManager:
             logging.error(f"Failed to update state: {str(e)}")
             # Don't raise - state update failure shouldn't stop ingestion
 
+
 # ============================================================================
 # SALESFORCE PROCESSOR CLASS
 # ============================================================================
+
 
 class SalesforceProcessor:
     """Handles Salesforce event log retrieval and processing"""
@@ -251,7 +258,7 @@ class SalesforceProcessor:
             raise
 
     def send_to_log_analytics(self, records: List[Dict[str, Any]]) -> None:
-        """Send parsed records to Log Analytics via DCE with DNS retry logic"""
+        """Send parsed records to Log Analytics via DCE with DNS retry logic - Memory efficient"""
         
         if not records:
             logging.info(f"No records to send for {self.env_name}")
@@ -275,7 +282,7 @@ class SalesforceProcessor:
             ]
             return any(indicator in error_str for indicator in dns_indicators)
 
-        def send_batch_with_retry(batch_data: List[Dict[str, Any]]) -> bool:
+        def send_batch_with_retry(batch_data: List[Dict[str, Any]], batch_num: int, batch_size_bytes: int) -> bool:
             """Send a single batch with comprehensive retry logic"""
             
             for attempt in range(MAX_DNS_RETRIES):
@@ -318,7 +325,7 @@ class SalesforceProcessor:
                             # Exponential backoff for DNS errors
                             wait_time = DNS_RETRY_BASE_DELAY * (2 ** attempt)
                             logging.warning(
-                                f"DNS resolution failure for {self.env_name} "
+                                f"DNS resolution failure for {self.env_name} - Batch #{batch_num} "
                                 f"(attempt {attempt + 1}/{MAX_DNS_RETRIES}): {str(e)[:200]} "
                                 f"- Retrying in {wait_time}s"
                             )
@@ -332,32 +339,36 @@ class SalesforceProcessor:
                         else:
                             # Max retries exceeded
                             logging.error(
-                                f"DNS resolution failed after {MAX_DNS_RETRIES} attempts for {self.env_name}. "
-                                f"Last error: {str(e)[:200]}"
+                                f"DNS resolution failed after {MAX_DNS_RETRIES} attempts for {self.env_name} "
+                                f"- Batch #{batch_num}. Last error: {str(e)[:200]}"
                             )
                             raise
                     else:
                         # Non-DNS network error - don't retry as aggressively
-                        logging.error(f"Network error (non-DNS) for {self.env_name}: {str(e)}")
+                        logging.error(f"Network error (non-DNS) for {self.env_name} - Batch #{batch_num}: {str(e)}")
                         raise
                         
                 except requests.exceptions.HTTPError as e:
                     # HTTP errors (4xx, 5xx) - log and raise immediately
-                    logging.error(f"HTTP error sending to Log Analytics for {self.env_name}: {str(e)}")
+                    logging.error(f"HTTP error sending to Log Analytics for {self.env_name} - Batch #{batch_num}: {str(e)}")
                     raise
                     
                 except Exception as e:
                     # Unexpected errors
-                    logging.error(f"Unexpected error sending batch for {self.env_name}: {str(e)}")
+                    logging.error(f"Unexpected error sending batch #{batch_num} for {self.env_name}: {str(e)}")
                     raise
             
             return False
 
-        # Main batching and sending logic
+        # Main batching and sending logic - STREAMING APPROACH
         try:
             current_batch = []
             current_batch_size = 0
+            batch_counter = 0
             total_sent = 0
+            total_records = len(records)
+
+            logging.info(f"Starting to process {total_records:,} records for {self.env_name}")
 
             for record in records:
                 record_json = json.dumps(record)
@@ -366,14 +377,17 @@ class SalesforceProcessor:
                 # Check if adding this record would exceed batch size
                 if current_batch and (current_batch_size + record_size > MAX_BATCH_SIZE_BYTES):
                     # Send current batch
-                    if send_batch_with_retry(current_batch):
+                    batch_counter += 1
+                    if send_batch_with_retry(current_batch, batch_counter, current_batch_size):
                         total_sent += len(current_batch)
+                        progress_pct = (total_sent / total_records) * 100
                         logging.info(
-                            f"Sent batch of {len(current_batch)} records "
-                            f"({current_batch_size / 1024:.1f} KB) for {self.env_name}"
+                            f"✓ Sent batch #{batch_counter}: {len(current_batch)} records "
+                            f"({current_batch_size / 1024:.1f} KB) for {self.env_name} "
+                            f"[{total_sent:,}/{total_records:,} records = {progress_pct:.1f}%]"
                         )
                     
-                    # Reset batch
+                    # Reset batch (frees memory)
                     current_batch = []
                     current_batch_size = 0
 
@@ -383,34 +397,50 @@ class SalesforceProcessor:
 
                 # Handle oversized single records
                 if current_batch_size > MAX_BATCH_SIZE_BYTES and len(current_batch) == 1:
+                    batch_counter += 1
                     logging.warning(
                         f"Single record exceeds size limit ({current_batch_size / 1024:.1f} KB) "
-                        f"for {self.env_name}, sending anyway"
+                        f"for {self.env_name}, sending anyway as batch #{batch_counter}"
                     )
-                    if send_batch_with_retry(current_batch):
+                    if send_batch_with_retry(current_batch, batch_counter, current_batch_size):
                         total_sent += 1
+                        progress_pct = (total_sent / total_records) * 100
+                        logging.info(
+                            f"✓ Sent oversized batch #{batch_counter} for {self.env_name} "
+                            f"[{total_sent:,}/{total_records:,} records = {progress_pct:.1f}%]"
+                        )
                     
                     current_batch = []
                     current_batch_size = 0
 
             # Send remaining records
             if current_batch:
-                if send_batch_with_retry(current_batch):
+                batch_counter += 1
+                if send_batch_with_retry(current_batch, batch_counter, current_batch_size):
                     total_sent += len(current_batch)
                     logging.info(
-                        f"Sent final batch of {len(current_batch)} records "
-                        f"({current_batch_size / 1024:.1f} KB) for {self.env_name}"
+                        f"✓ Sent final batch #{batch_counter}: {len(current_batch)} records "
+                        f"({current_batch_size / 1024:.1f} KB) for {self.env_name} "
+                        f"[{total_sent:,}/{total_records:,} records = 100%]"
                     )
 
-            logging.info(f"Successfully sent {total_sent} total records to Log Analytics for {self.env_name}")
+            logging.info(
+                f"Successfully completed: Sent {total_sent:,} total records "
+                f"in {batch_counter} batch(es) to Log Analytics for {self.env_name}"
+            )
 
         except Exception as e:
-            logging.error(f"Failed to send data to Log Analytics for {self.env_name}: {str(e)}")
+            logging.error(
+                f"Failed to send data to Log Analytics for {self.env_name} "
+                f"after processing {total_sent:,}/{total_records:,} records in {batch_counter} batches: {str(e)}"
+            )
             raise
+
 
 # ============================================================================
 # MAIN PROCESSING FUNCTION
 # ============================================================================
+
 
 def process_salesforce_data():
     """Main processing function with deduplication"""
@@ -484,11 +514,14 @@ def process_salesforce_data():
         logging.error(f"Fatal error in main processing: {str(e)}")
         raise
 
+
 # ============================================================================
 # AZURE FUNCTION DEFINITION
 # ============================================================================
 
+
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
+
 
 @app.timer_trigger(schedule="0 0 * * * *", 
                    arg_name="myTimer", 
