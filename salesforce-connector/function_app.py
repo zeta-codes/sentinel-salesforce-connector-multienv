@@ -247,7 +247,7 @@ class SalesforceProcessor:
             raise
 
     def send_to_log_analytics(self, records: List[Dict[str, Any]]) -> None:
-        """Send parsed records to Log Analytics via DCE"""
+        """Send parsed records to Log Analytics via DCE with dynamic batch sizing"""
         try:
             if not records:
                 logging.info(f"No records to send for {self.env_name}")
@@ -264,16 +264,62 @@ class SalesforceProcessor:
                 'Content-Type': 'application/json'
             }
 
-            # Send in batches of 500 records
-            batch_size = 500
-            for i in range(0, len(records), batch_size):
-                batch = records[i:i + batch_size]
-                response = requests.post(dce_url, headers=headers, json=batch)
+            # Dynamic batching based on payload size (max 1 MB per API call)
+            MAX_BATCH_SIZE_BYTES = 900_000  # 900 KB safety margin (1 MB = 1,048,576 bytes)
+            current_batch = []
+            current_batch_size = 0
+            total_sent = 0
+
+            for record in records:
+                # Estimate record size (JSON serialized)
+                record_json = json.dumps(record)
+                record_size = len(record_json.encode('utf-8'))
+
+                # If adding this record would exceed the limit, send current batch
+                if current_batch and (current_batch_size + record_size > MAX_BATCH_SIZE_BYTES):
+                    # Send current batch
+                    response = requests.post(dce_url, headers=headers, json=current_batch)
+                    response.raise_for_status()
+                    
+                    total_sent += len(current_batch)
+                    logging.info(f"Sent batch of {len(current_batch)} records "
+                               f"({current_batch_size / 1024:.1f} KB) for {self.env_name}")
+                    
+                    # Reset batch
+                    current_batch = []
+                    current_batch_size = 0
+
+                # Add record to current batch
+                current_batch.append(record)
+                current_batch_size += record_size
+
+                # Safety check: if single record exceeds limit, send it alone
+                if current_batch_size > MAX_BATCH_SIZE_BYTES and len(current_batch) == 1:
+                    logging.warning(f"Single record exceeds size limit ({current_batch_size / 1024:.1f} KB), "
+                                  f"sending anyway and may fail")
+                    response = requests.post(dce_url, headers=headers, json=current_batch)
+                    response.raise_for_status()
+                    
+                    total_sent += 1
+                    current_batch = []
+                    current_batch_size = 0
+
+            # Send remaining records
+            if current_batch:
+                response = requests.post(dce_url, headers=headers, json=current_batch)
                 response.raise_for_status()
-                logging.info(f"Sent {len(batch)} records to Log Analytics for {self.env_name}")
+                
+                total_sent += len(current_batch)
+                logging.info(f"Sent final batch of {len(current_batch)} records "
+                           f"({current_batch_size / 1024:.1f} KB) for {self.env_name}")
+
+            logging.info(f"Successfully sent {total_sent} total records to Log Analytics for {self.env_name}")
+
         except Exception as e:
             logging.error(f"Failed to send data to Log Analytics for {self.env_name}: {str(e)}")
             raise
+
+
 
 
 # ============================================================================
@@ -361,7 +407,7 @@ def process_salesforce_data():
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 
-@app.timer_trigger(schedule="0 0 * * * *", 
+@app.timer_trigger(schedule="0 */5 * * * *", 
                    arg_name="myTimer", 
                    run_on_startup=False,
                    use_monitor=False)
