@@ -4,11 +4,15 @@ import os
 import json
 import csv
 import io
+import time
+import socket
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 
 # Import external packages at MODULE LEVEL
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
 from azure.data.tables import TableClient
@@ -20,6 +24,8 @@ STREAM_NAME = os.environ.get('STREAM_NAME')
 ENVIRONMENTS_JSON = os.environ.get('ENVIRONMENTS_JSON')
 STATE_STORAGE_ACCOUNT = os.environ.get('STATE_STORAGE_ACCOUNT')
 
+# Initialize credential at MODULE LEVEL for reuse
+credential = DefaultAzureCredential()
 
 # ============================================================================
 # STATE MANAGER CLASS
@@ -76,7 +82,6 @@ class StateManager:
             logging.error(f"Failed to update state: {str(e)}")
             # Don't raise - state update failure shouldn't stop ingestion
 
-
 # ============================================================================
 # SALESFORCE PROCESSOR CLASS
 # ============================================================================
@@ -113,7 +118,7 @@ class SalesforceProcessor:
                 'client_secret': client_secret
             }
 
-            response = requests.post(token_url, data=data)
+            response = requests.post(token_url, data=data, timeout=30)
             response.raise_for_status()
             self.access_token = response.json()['access_token']
             logging.info(f"Successfully authenticated with Salesforce for {self.env_name}")
@@ -144,7 +149,7 @@ class SalesforceProcessor:
             }
 
             query_url = f"{self.sf_domain}/services/data/v55.0/query"
-            response = requests.get(query_url, headers=headers, params={'q': query})
+            response = requests.get(query_url, headers=headers, params={'q': query}, timeout=60)
             response.raise_for_status()
 
             all_records = response.json().get('records', [])
@@ -176,7 +181,7 @@ class SalesforceProcessor:
         try:
             headers = {'Authorization': f'Bearer {self.access_token}'}
             url = f"{self.sf_domain}{log_file_path}"
-            response = requests.get(url, headers=headers)
+            response = requests.get(url, headers=headers, timeout=120)
             response.raise_for_status()
             return response.text
         except Exception as e:
@@ -218,7 +223,6 @@ class SalesforceProcessor:
 
                 timestamp_derived = dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
-
                 # Build unique identifier for deduplication
                 unique_id = f"{self.env_name}_{event_type}_{log_date}_{sequence}"
 
@@ -232,8 +236,8 @@ class SalesforceProcessor:
                     'RequestId': row.get('REQUEST_ID', ''),
                     'UserId': row.get('USER_ID', ''),
                     'UserName': row.get('USER_NAME', ''),
-                    'UniqueLogFileId': unique_id,  # NEW: For query-time deduplication
-                    'LogFileSequence': sequence,    # NEW: Track sequence
+                    'UniqueLogFileId': unique_id,
+                    'LogFileSequence': sequence,
                     'JsonData': row,
                     'RawData': ','.join([f'"{v}"' if ',' in str(v) else str(v) for v in row.values()])
                 }
@@ -247,43 +251,127 @@ class SalesforceProcessor:
             raise
 
     def send_to_log_analytics(self, records: List[Dict[str, Any]]) -> None:
-        """Send parsed records to Log Analytics via DCE with dynamic batch sizing"""
+        """Send parsed records to Log Analytics via DCE with DNS retry logic"""
+        
+        if not records:
+            logging.info(f"No records to send for {self.env_name}")
+            return
+
+        # Configuration for DNS-specific retries
+        MAX_DNS_RETRIES = 8
+        DNS_RETRY_BASE_DELAY = 3  # seconds
+        MAX_BATCH_SIZE_BYTES = 900_000
+
+        def is_dns_error(exception) -> bool:
+            """Check if exception is DNS-related"""
+            error_str = str(exception).lower()
+            dns_indicators = [
+                'failed to resolve',
+                'name resolution',
+                'gaierror',
+                'errno -3',
+                'nodename nor servname',
+                'temporary failure in name resolution'
+            ]
+            return any(indicator in error_str for indicator in dns_indicators)
+
+        def send_batch_with_retry(batch_data: List[Dict[str, Any]]) -> bool:
+            """Send a single batch with comprehensive retry logic"""
+            
+            for attempt in range(MAX_DNS_RETRIES):
+                try:
+                    # Refresh token on each attempt to avoid expiration
+                    token = self.credential.get_token("https://monitor.azure.com/.default")
+                    
+                    dce_url = f"{DCE_ENDPOINT}/dataCollectionRules/{self.dcr_immutable_id}/streams/{STREAM_NAME}?api-version=2023-01-01"
+                    
+                    headers = {
+                        'Authorization': f'Bearer {token.token}',
+                        'Content-Type': 'application/json'
+                    }
+                    
+                    # Create fresh session with HTTP retry strategy
+                    session = requests.Session()
+                    retry_strategy = Retry(
+                        total=3,
+                        backoff_factor=1,
+                        status_forcelist=[429, 500, 502, 503, 504],
+                        allowed_methods=["POST"]
+                    )
+                    adapter = HTTPAdapter(max_retries=retry_strategy)
+                    session.mount("https://", adapter)
+                    
+                    # Attempt the request
+                    response = session.post(dce_url, headers=headers, json=batch_data, timeout=120)
+                    response.raise_for_status()
+                    session.close()
+                    
+                    return True  # Success
+                    
+                except (requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout,
+                        OSError,
+                        socket.gaierror) as e:
+                    
+                    if is_dns_error(e):
+                        if attempt < MAX_DNS_RETRIES - 1:
+                            # Exponential backoff for DNS errors
+                            wait_time = DNS_RETRY_BASE_DELAY * (2 ** attempt)
+                            logging.warning(
+                                f"DNS resolution failure for {self.env_name} "
+                                f"(attempt {attempt + 1}/{MAX_DNS_RETRIES}): {str(e)[:200]} "
+                                f"- Retrying in {wait_time}s"
+                            )
+                            time.sleep(wait_time)
+                            
+                            # Attempt to clear DNS cache
+                            try:
+                                socket.setdefaulttimeout(30)
+                            except:
+                                pass
+                        else:
+                            # Max retries exceeded
+                            logging.error(
+                                f"DNS resolution failed after {MAX_DNS_RETRIES} attempts for {self.env_name}. "
+                                f"Last error: {str(e)[:200]}"
+                            )
+                            raise
+                    else:
+                        # Non-DNS network error - don't retry as aggressively
+                        logging.error(f"Network error (non-DNS) for {self.env_name}: {str(e)}")
+                        raise
+                        
+                except requests.exceptions.HTTPError as e:
+                    # HTTP errors (4xx, 5xx) - log and raise immediately
+                    logging.error(f"HTTP error sending to Log Analytics for {self.env_name}: {str(e)}")
+                    raise
+                    
+                except Exception as e:
+                    # Unexpected errors
+                    logging.error(f"Unexpected error sending batch for {self.env_name}: {str(e)}")
+                    raise
+            
+            return False
+
+        # Main batching and sending logic
         try:
-            if not records:
-                logging.info(f"No records to send for {self.env_name}")
-                return
-
-            # Get Azure Monitor access token
-            token = self.credential.get_token("https://monitor.azure.com/.default")
-
-            # Prepare the DCE URL
-            dce_url = f"{DCE_ENDPOINT}/dataCollectionRules/{self.dcr_immutable_id}/streams/{STREAM_NAME}?api-version=2023-01-01"
-
-            headers = {
-                'Authorization': f'Bearer {token.token}',
-                'Content-Type': 'application/json'
-            }
-
-            # Dynamic batching based on payload size (max 1 MB per API call)
-            MAX_BATCH_SIZE_BYTES = 900_000  # 900 KB safety margin (1 MB = 1,048,576 bytes)
             current_batch = []
             current_batch_size = 0
             total_sent = 0
 
             for record in records:
-                # Estimate record size (JSON serialized)
                 record_json = json.dumps(record)
                 record_size = len(record_json.encode('utf-8'))
 
-                # If adding this record would exceed the limit, send current batch
+                # Check if adding this record would exceed batch size
                 if current_batch and (current_batch_size + record_size > MAX_BATCH_SIZE_BYTES):
                     # Send current batch
-                    response = requests.post(dce_url, headers=headers, json=current_batch)
-                    response.raise_for_status()
-                    
-                    total_sent += len(current_batch)
-                    logging.info(f"Sent batch of {len(current_batch)} records "
-                               f"({current_batch_size / 1024:.1f} KB) for {self.env_name}")
+                    if send_batch_with_retry(current_batch):
+                        total_sent += len(current_batch)
+                        logging.info(
+                            f"Sent batch of {len(current_batch)} records "
+                            f"({current_batch_size / 1024:.1f} KB) for {self.env_name}"
+                        )
                     
                     # Reset batch
                     current_batch = []
@@ -293,34 +381,32 @@ class SalesforceProcessor:
                 current_batch.append(record)
                 current_batch_size += record_size
 
-                # Safety check: if single record exceeds limit, send it alone
+                # Handle oversized single records
                 if current_batch_size > MAX_BATCH_SIZE_BYTES and len(current_batch) == 1:
-                    logging.warning(f"Single record exceeds size limit ({current_batch_size / 1024:.1f} KB), "
-                                  f"sending anyway and may fail")
-                    response = requests.post(dce_url, headers=headers, json=current_batch)
-                    response.raise_for_status()
+                    logging.warning(
+                        f"Single record exceeds size limit ({current_batch_size / 1024:.1f} KB) "
+                        f"for {self.env_name}, sending anyway"
+                    )
+                    if send_batch_with_retry(current_batch):
+                        total_sent += 1
                     
-                    total_sent += 1
                     current_batch = []
                     current_batch_size = 0
 
             # Send remaining records
             if current_batch:
-                response = requests.post(dce_url, headers=headers, json=current_batch)
-                response.raise_for_status()
-                
-                total_sent += len(current_batch)
-                logging.info(f"Sent final batch of {len(current_batch)} records "
-                           f"({current_batch_size / 1024:.1f} KB) for {self.env_name}")
+                if send_batch_with_retry(current_batch):
+                    total_sent += len(current_batch)
+                    logging.info(
+                        f"Sent final batch of {len(current_batch)} records "
+                        f"({current_batch_size / 1024:.1f} KB) for {self.env_name}"
+                    )
 
             logging.info(f"Successfully sent {total_sent} total records to Log Analytics for {self.env_name}")
 
         except Exception as e:
             logging.error(f"Failed to send data to Log Analytics for {self.env_name}: {str(e)}")
             raise
-
-
-
 
 # ============================================================================
 # MAIN PROCESSING FUNCTION
@@ -329,9 +415,8 @@ class SalesforceProcessor:
 def process_salesforce_data():
     """Main processing function with deduplication"""
     try:
-        # Initialize Azure credential
-        credential = DefaultAzureCredential()
-
+        # Use module-level credential (already initialized)
+        
         # Initialize Key Vault client
         kv_uri = f"https://{KEY_VAULT_NAME}.vault.azure.net"
         kv_client = SecretClient(vault_url=kv_uri, credential=credential)
@@ -381,7 +466,7 @@ def process_salesforce_data():
                         csv_content, event_type, log_date, sequence
                     )
 
-                    # Send to Log Analytics
+                    # Send to Log Analytics (with retry logic)
                     processor.send_to_log_analytics(json_records)
 
                     # Update state AFTER successful ingestion
@@ -399,13 +484,11 @@ def process_salesforce_data():
         logging.error(f"Fatal error in main processing: {str(e)}")
         raise
 
-
 # ============================================================================
 # AZURE FUNCTION DEFINITION
 # ============================================================================
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
-
 
 @app.timer_trigger(schedule="0 0 * * * *", 
                    arg_name="myTimer", 
@@ -415,7 +498,7 @@ def SalesforceToSentinel(myTimer: func.TimerRequest) -> None:
     """
     Timer trigger function that runs every hour to fetch Salesforce event logs
     and send them to Azure Sentinel via Log Analytics.
-    Includes deduplication and recovery logic.
+    Includes deduplication, recovery logic, and DNS failure retry handling.
     """
     if myTimer.past_due:
         logging.info('The timer is past due!')
