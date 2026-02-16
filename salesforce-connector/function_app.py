@@ -407,7 +407,7 @@ def process_salesforce_data():
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 
-@app.timer_trigger(schedule="0 */5 * * * *", 
+@app.timer_trigger(schedule="0 0 * * * *", 
                    arg_name="myTimer", 
                    run_on_startup=False,
                    use_monitor=False)
