@@ -452,4 +452,5 @@ SalesforceServiceCloudV2_CL
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-02-13 | Initial release with multi-environment support |
+| 1.1 | 2026-02-17 | Fixed DNS resolution overload issues happening in large environments |
 
